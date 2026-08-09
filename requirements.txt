@@ -1,0 +1,10 @@
+strawberry-graphql[fastapi]>=0.240
+asyncpg>=0.29
+PyJWT>=2.7
+bcrypt>=4.1
+httpx>=0.28
+uvicorn[standard]>=0.30
+
+# Dependencias solo para tests (ver README > Tests)
+pytest>=8.0
+pytest-asyncio>=1.0
