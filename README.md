@@ -13,6 +13,7 @@ definido en `archivo_corrupcion_schema.sql`.
 | `mappers.py` | asyncpg.Record → tipos de Strawberry (compartido) |
 | `db.py` | Toda la SQL parametrizada: lectura, búsqueda faceteada, escritura |
 | `search_engine.py` | Sincronización con Meilisearch (indexar/borrar/buscar); no-op si no está configurado |
+| `rate_limit.py` | Rate limiting por API key (Redis); no-op si no está configurado |
 | `dataloaders.py` | Un DataLoader por relación, para evitar N+1 |
 | `auth.py` | JWT (equipo interno), hashing de contraseñas, API keys (terceros) |
 | `permissions.py` | Clases de permiso por rol |
@@ -21,6 +22,12 @@ definido en `archivo_corrupcion_schema.sql`.
 | `mutations.py` | Mutation root (solo en el schema interno) |
 | `schema.py` | Construye `schema_interno` y `schema_publico` |
 | `app.py` | FastAPI: monta ambos routers y el ciclo de vida de la pool |
+
+Fuera del paquete `graphql_api/`, en `scripts/`:
+
+| Archivo | Responsabilidad |
+|---|---|
+| `reindexar_meilisearch.py` | Reindexado masivo inicial (primer deploy, o reconstruir el índice) |
 
 Todo el paquete fue validado con **tests de integración reales contra
 PostgreSQL** (no solo import checks): 46 tests que corren el schema SQL
@@ -55,6 +62,7 @@ Los tests están en `tests/`, organizados por capa:
 | `test_graphql_flow.py` | Flujo de moderación de punta a punta (colaborador propone → admin aprueba → aparece en la búsqueda pública, con su registro en el audit log), permisos por rol, y el caso real de la legisladora (`hecho_relacion` cruzando `declaracion` → `hecho_judicial`) |
 | `test_schema_publico.py` | Que el schema público no tenga `Mutation`, y que el límite de profundidad de query realmente rechace una consulta anidada de más de 10 niveles (no solo que esté declarado) |
 | `test_search_engine.py` | Construcción de documentos (con nombres de relaciones ya resueltos, arrays vacíos en vez de `None`) y de los filtros de Meilisearch (OR interno, AND entre facetas) — sin necesitar una instancia de Meilisearch corriendo |
+| `test_rate_limit.py` | Lectura de la variable de entorno y comportamiento con rate limiting deshabilitado — sin necesitar una instancia de Redis corriendo |
 
 Cada test corre dentro de una transacción que se revierte al final
 (`tests/conftest.py`), así que no hace falta limpiar la base entre tests
@@ -95,6 +103,10 @@ pip install -r requirements.txt
 export DATABASE_URL="postgresql://usuario:password@localhost:5432/archivo_corrupcion"
 export JWT_SECRET="una-clave-larga-y-aleatoria"   # nunca el valor default en producción
 ```
+
+Opcionales, cada una con su propio fallback si no se setea (ver las
+secciones "Meilisearch" y "Rate limiting" más abajo): `MEILISEARCH_URL`,
+`MEILISEARCH_API_KEY`, `REDIS_URL`.
 
 ## Correr en desarrollo
 
@@ -229,6 +241,51 @@ Al arrancar, `app.py` llama a `search_engine.configurar_indices()`
 (define qué campos son buscables/filtrables/ordenables en cada índice) —
 no hace falta correr nada a mano aparte de tener el motor levantado.
 
+### Reindexado masivo (`scripts/reindexar_meilisearch.py`)
+
+La sincronización de `mutations.py` solo cubre contenido que se crea o
+edita **después** de que Meilisearch ya está configurado. Hace falta un
+reindexado masivo aparte en dos casos: el primer deploy con Meilisearch
+(ya hay contenido publicado de antes en Postgres, y el índice arranca
+vacío), o reconstruir el índice desde cero (se borró por accidente, se
+cambió `configurar_indices()` de forma incompatible, o se migra a una
+instancia nueva).
+
+```bash
+# Desde la raíz del repo, con las mismas variables de entorno que la API
+# (DATABASE_URL, MEILISEARCH_URL, y MEILISEARCH_API_KEY si aplica):
+python -m scripts.reindexar_meilisearch
+
+# Reindexar solo un tipo de contenido:
+python -m scripts.reindexar_meilisearch --solo hechos
+python -m scripts.reindexar_meilisearch --solo declaraciones
+
+# Tamaño de tanda hacia Postgres/Meilisearch (default 500):
+python -m scripts.reindexar_meilisearch --lote 200
+
+# Si ya se corrió antes y el settings de Meilisearch no cambió, se puede
+# saltear el PATCH de configuración de índices:
+python -m scripts.reindexar_meilisearch --sin-configurar-indices
+```
+
+Reusa los mismos constructores de documento que la sincronización normal
+(`search_engine._documento_hecho_judicial` / `_documento_declaracion`),
+así el documento que arma el script es idéntico al que arma una escritura
+en producción — no hay dos caminos de armado de documento que puedan
+desincronizarse entre sí. Recorre Postgres paginado por cursor de id
+(`db.fetch_lote_vista_busqueda_*`) para no cargar todo el archivo en
+memoria de una, y manda cada tanda a Meilisearch en un solo POST
+(`search_engine.indexar_lote`) en vez de un request por documento.
+
+Es idempotente: Meilisearch upsertea por `id`, así que correrlo dos veces
+— o interrumpirlo a mitad de camino y volver a correrlo desde el
+principio — no duplica nada. Validado de punta a punta contra una
+instancia real de Postgres + Meilisearch: indexa solo lo publicado
+(un hecho `pendiente_aprobacion` de prueba quedó afuera correctamente),
+la paginación por cursor funciona con tandas chicas forzando múltiples
+vueltas, `--solo` filtra bien, y correrlo dos veces seguidas no duplica
+documentos.
+
 ### Qué se validó
 
 `test_search_engine.py` cubre la construcción de documentos y filtros
@@ -242,7 +299,8 @@ funcione— se probó a mano contra una instancia real de Meilisearch
 automática porque encadenar dos servicios (Postgres + Meilisearch) en
 cada corrida de tests es infraestructura que no se justifica todavía
 para este proyecto; si más adelante se arma un `docker-compose` para CI,
-ese es el lugar natural para sumar esa prueba end-to-end.
+ese es el lugar natural para sumar esa prueba end-to-end (y el
+reindexado masivo junto con ella).
 
 ### Filtros de texto libre no cubiertos todavía
 
@@ -254,22 +312,110 @@ filtro explícito (no solo búsqueda de texto), agregar `personas_ids`
 como filterableAttribute siguiendo el mismo patrón que
 `organizaciones_ids`.
 
+## Rate limiting (API pública)
+
+`rate_limit.py` hace cumplir el `rate_limit_por_minuto` que ya se
+guardaba por fila en `api_key` pero que hasta ahora nadie hacía cumplir.
+Es la pieza que sostiene la decisión de registro automático sin
+aprobación manual (`solicitarApiKey`): el control de abuso no pasa por
+filtrar quién se registra, pasa por acá — si una key abusa, se revoca
+puntualmente después de detectarlo, no se audita antes de emitirla.
+
+### Cómo funciona
+
+- Contador compartido en Redis (`INCR` + `EXPIRE`), ventana fija de 60s
+  alineada al reloj — no al primer request de cada cliente, así todas
+  las API keys comparten el mismo punto de corte de minuto. Se aplica
+  **solo** en la superficie pública (`contexto_publico`, en
+  `context.py`) — la interna usa JWT y no pasa por acá.
+- Por qué Redis y no un contador en memoria del proceso: en cuanto
+  FastAPI/uvicorn corre con más de un worker, cada worker tendría su
+  propio contador y el límite real terminaría siendo
+  `rate_limit_por_minuto × cantidad_de_workers`. Redis es el contador
+  compartido entre workers.
+- Cada response de la superficie pública trae los headers
+  `X-RateLimit-Limit`, `X-RateLimit-Remaining` y `X-RateLimit-Reset`
+  (segundos hasta que abre la próxima ventana). Al superar el límite, la
+  respuesta es `429` con `Retry-After` además de los anteriores.
+- Trade-off conocido y aceptado de la ventana fija (misma lógica que los
+  límites fijos de profundidad/alias/tokens de `schema.py`): un cliente
+  puede rozar ~2x el límite si concentra requests justo en el borde entre
+  dos minutos consecutivos. Punto de partida razonable — pasar a sliding
+  window si en producción se ve abuso real aprovechando ese borde.
+- Sin Redis disponible: **fail-open**, no fail-closed. Sin `REDIS_URL`
+  seteada, el rate limiting queda deshabilitado (se loguea un warning una
+  sola vez al arrancar) — mismo patrón que Meilisearch, para no forzar a
+  levantar Redis también solo para desarrollar localmente. Si `REDIS_URL`
+  está seteada pero Redis no responde en el momento de un request
+  puntual, también se deja pasar el request (con `logger.error`) en vez
+  de tumbar la API pública entera por la caída de un sistema secundario —
+  mismo criterio que ya se usa con fallos de Meilisearch. Si se prefiere
+  el criterio inverso (negar el request si Redis no responde,
+  priorizando el control de abuso por sobre la disponibilidad), está
+  documentado en el docstring de `rate_limit.py` dónde invertirlo.
+
+### Variables de entorno
+
+```bash
+export REDIS_URL="redis://localhost:6379"
+```
+
+### Un detalle no obvio de FastAPI que esto encontró
+
+`contexto_publico` recibe un parámetro `response: Response` y en el
+camino exitoso simplemente hace `response.headers.update(...)` — FastAPI
+comparte esa misma instancia de `Response` entre todas las dependencias
+de un request, así que los headers puestos ahí llegan de verdad a la
+respuesta final aunque el dependency-getter termine antes de que
+Strawberry arme el cuerpo de la respuesta.
+
+**Pero eso deja de ser cierto en el camino de error.** Cuando se levanta
+`HTTPException` (el caso 429), Starlette arma la respuesta de error
+**desde cero** (`fastapi.exception_handlers.http_exception_handler`) y
+no la mezcla con el `Response` temporal de la dependencia — mutar
+`response.headers` ahí se pierde en silencio, sin ningún error que lo
+avise. Se detectó probando la integración real de punta a punta (no solo
+import checks): en la primera versión, `X-RateLimit-*` y `Retry-After`
+aparecían correctamente en los `200` pero desaparecían en los `429`,
+exactamente donde más importan (es el header que le dice al cliente
+cuánto esperar antes de reintentar). La corrección fue pasarlos
+explícitos vía `HTTPException(..., headers={...})`, que sí es tomado por
+el handler. Quedó comentado en el código en el lugar exacto para que no
+se repita el error si se toca ese bloque más adelante.
+
+### Qué se validó
+
+`test_rate_limit.py` cubre la lectura de la variable de entorno y el
+comportamiento con Redis deshabilitado (sin necesitar una instancia
+corriendo). El resto — INCR/TTL contra Redis real, que se bloquee
+exactamente al superar el límite y no antes, el modo fail-open cuando
+Redis no responde, y sobre todo que los headers `X-RateLimit-*` /
+`Retry-After` lleguen de verdad al cliente HTTP en el `200` **y** en el
+`429`— se probó a mano de punta a punta: Postgres + Redis reales, una
+API key de prueba con límite bajo, y un cliente HTTP real haciendo varios
+requests seguidos hasta gatillar el `429`. No quedó en la suite
+automática por la misma razón que Meilisearch: encadenar tres servicios
+(Postgres + Meilisearch + Redis) en cada corrida de tests es
+infraestructura que no se justifica todavía para este proyecto — mismo
+lugar natural (`docker-compose` para CI) si más adelante se decide sumar
+esa prueba end-to-end.
+
 ## Pendiente antes de producción
 
 - **Tests de carga/concurrencia real**: los tests actuales prueban
   correctud funcional contra Postgres real; falta un test que abra
   muchas conexiones simultáneas contra un pool chico para calibrar
   `min_size`/`max_size` en `db.py` según el tráfico esperado.
-- **Rate limiting real** por API key (acá se guarda `rate_limit_por_minuto`
-  en la tabla, pero falta el middleware que lo haga cumplir — ej. con
-  `slowapi` o un contador en Redis).
-- **Reindexado masivo inicial**: `search_engine.py` sincroniza un
-  documento por escritura, pero no hay un script que recorra todo lo ya
-  publicado y lo indexe de una — hace falta para el primer deploy con
-  Meilisearch, o para reconstruir el índice si hay que borrarlo.
-- **Docker-compose para CI**: correr Postgres + Meilisearch juntos en la
-  suite de tests (ver nota en la sección de Meilisearch).
+- **Docker-compose para CI**: correr Postgres + Meilisearch + Redis
+  juntos en la suite de tests (ver notas en las secciones de Meilisearch
+  y Rate limiting).
 - **Índice de conteo de facetas (fallback Postgres)**: `contar_facetas_*`
   hace varios `GROUP BY` por request; solo aplica cuando Meilisearch no
   está configurado, pero si ese fallback se usa en producción con
   volumen alto, conviene cachear estos conteos unos segundos.
+- **`limite_profundidad_query` sin usar**: la tabla `api_key` y
+  `ApiKeyActual` ya traen este campo por fila, pero `schema_publico`
+  (`schema.py`) aplica un `QueryDepthLimiter` con un `max_depth=10` fijo
+  para todas las keys por igual — el límite por-key nunca se lee todavía.
+  No se tocó en esta tanda (es un cambio en `schema.py`/`app.py`, no en
+  rate limiting), pero quedó anotado acá para no perderlo de vista.
