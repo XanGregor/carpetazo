@@ -14,6 +14,7 @@ definido en `archivo_corrupcion_schema.sql`.
 | `db.py` | Toda la SQL parametrizada: lectura, búsqueda faceteada, escritura |
 | `search_engine.py` | Sincronización con Meilisearch (indexar/borrar/buscar); no-op si no está configurado |
 | `rate_limit.py` | Rate limiting por API key (Redis); no-op si no está configurado |
+| `extensions.py` | Extensión de Strawberry: límite de profundidad de query por API key |
 | `dataloaders.py` | Un DataLoader por relación, para evitar N+1 |
 | `auth.py` | JWT (equipo interno), hashing de contraseñas, API keys (terceros) |
 | `permissions.py` | Clases de permiso por rol |
@@ -29,13 +30,20 @@ Fuera del paquete `graphql_api/`, en `scripts/`:
 |---|---|
 | `reindexar_meilisearch.py` | Reindexado masivo inicial (primer deploy, o reconstruir el índice) |
 
+También en la raíz del repo:
+
+| Archivo | Responsabilidad |
+|---|---|
+| `docker-compose.yml` | Postgres + Meilisearch + Redis para desarrollo local y CI (ver sección "Tests end-to-end / CI") |
+| `.github/workflows/tests.yml` | Levanta el compose y corre `pytest tests/` en cada push/PR |
+
 Todo el paquete fue validado con **tests de integración reales contra
 PostgreSQL** (no solo import checks): 46 tests que corren el schema SQL
 completo, ejecutan mutations y queries de GraphQL de punta a punta,
 verifican los permisos por rol, y prueban la construcción de documentos/
-filtros de Meilisearch. La sincronización con Meilisearch en sí (indexar,
-buscar, facetas, borrado) se validó aparte contra una instancia real — ver
-la sección "Meilisearch" más abajo. Ese proceso encontró y corrigió dos
+filtros de Meilisearch — más otros 12 tests end-to-end contra Meilisearch,
+Redis y el schema público real, corriendo con `docker-compose.yml` (ver
+"Tests end-to-end / CI" más abajo). Ese proceso encontró y corrigió varios
 bugs reales antes de que llegaran a producción — ver "Qué encontraron los
 tests" más abajo.
 
@@ -63,10 +71,55 @@ Los tests están en `tests/`, organizados por capa:
 | `test_schema_publico.py` | Que el schema público no tenga `Mutation`, y que el límite de profundidad de query realmente rechace una consulta anidada de más de 10 niveles (no solo que esté declarado) |
 | `test_search_engine.py` | Construcción de documentos (con nombres de relaciones ya resueltos, arrays vacíos en vez de `None`) y de los filtros de Meilisearch (OR interno, AND entre facetas) — sin necesitar una instancia de Meilisearch corriendo |
 | `test_rate_limit.py` | Lectura de la variable de entorno y comportamiento con rate limiting deshabilitado — sin necesitar una instancia de Redis corriendo |
+| `test_extensions.py` | Lógica de selección del límite de profundidad por API key (default, límite en cero/negativo, contexto ausente) — sin necesitar levantar un execution_context real de Strawberry |
+| `test_search_engine_e2e.py` | **End-to-end contra Meilisearch real**: indexar, buscar por texto, filtrar por faceta (incluido el array `organizaciones_ids`), forma de `facetDistribution`, que lo no-publicado nunca aparezca, y borrado — se salta si no hay `MEILISEARCH_URL` |
+| `test_rate_limit_e2e.py` | **End-to-end contra Redis real** vía `TestClient` sobre la app real: bloqueo exacto al superar el límite, contadores independientes por API key, y que los headers `X-RateLimit-*`/`Retry-After` lleguen en el `200` **y** en el `429` — se salta si no hay `REDIS_URL` |
+| `test_extensions_e2e.py` | **End-to-end contra el schema público real**: la misma query anidada rechazada o aceptada según el `limite_profundidad_query` de la API key usada |
 
 Cada test corre dentro de una transacción que se revierte al final
 (`tests/conftest.py`), así que no hace falta limpiar la base entre tests
-ni mantener fixtures de datos permanentes.
+ni mantener fixtures de datos permanentes — con la excepción de los tests
+`*_e2e.py`, que necesitan datos realmente commiteados para que la app
+(con su propio pool de conexiones) los vea; ver la sección siguiente.
+
+### Tests end-to-end / CI
+
+Los archivos `test_search_engine_e2e.py`, `test_rate_limit_e2e.py` y
+`test_extensions_e2e.py` corren contra instancias reales de Meilisearch/
+Redis (además de Postgres, que ya hace falta para toda la suite) — antes
+de tener `docker-compose.yml` estas pruebas se hacían a mano en cada
+sesión de trabajo; ahora están automatizadas.
+
+```bash
+docker compose up -d --wait   # Postgres + Meilisearch + Redis
+psql -h localhost -U postgres -d archivo_corrupcion_test -f archivo_corrupcion_schema.sql  # solo si el compose no lo cargó solo, ver nota abajo
+
+DATABASE_URL="postgresql://postgres:postgres@localhost:5432/archivo_corrupcion_test" \
+JWT_SECRET="cualquier-valor-para-tests" \
+MEILISEARCH_URL="http://localhost:7700" \
+MEILISEARCH_API_KEY="clave-de-desarrollo" \
+REDIS_URL="redis://localhost:6379" \
+python -m pytest tests/ -v
+
+docker compose down -v
+```
+
+- `docker-compose.yml` monta `archivo_corrupcion_schema.sql` como script
+  de inicialización de Postgres (`docker-entrypoint-initdb.d/`) — se
+  carga solo la primera vez que el contenedor arranca con un data
+  directory vacío. El `psql` de arriba es solo para el caso de correr
+  Postgres por fuera del compose.
+- Los tests `*_e2e.py` se saltean solos (`SKIPPED`, no `FAILED`) si
+  `MEILISEARCH_URL`/`REDIS_URL` no están seteadas — no todos los entornos
+  donde corre la suite van a tener los tres servicios levantados.
+- Necesitan una API key real commiteada en la base (no alcanza con la
+  transacción de la fixture `con`, que se revierte): la app real usa su
+  propio pool de conexiones (`db.get_pool()`), que no ve nada de lo que
+  esté sin commitear en la transacción del test. `conftest.py` trae un
+  fixture factory para esto — `api_key_temporal` — que inserta con
+  COMMIT real y borra a mano al terminar el test.
+- `.github/workflows/tests.yml` corre exactamente este mismo compose en
+  cada push/PR.
 
 ### Qué encontraron los tests (y ya está corregido en este paquete)
 
@@ -288,19 +341,16 @@ documentos.
 
 ### Qué se validó
 
-`test_search_engine.py` cubre la construcción de documentos y filtros
-(sin necesitar el motor corriendo). La sincronización end-to-end en sí
-—indexar, buscar por texto, filtrar por faceta (incluyendo el filtro por
-array `organizaciones_ids`, que en Meilisearch funciona como "el array
-contiene este valor"), que `facetDistribution` tenga la forma que
-`queries.py` espera, que lo no-publicado nunca aparezca, y que borrar
-funcione— se probó a mano contra una instancia real de Meilisearch
-1.x, con resultados correctos en los cinco casos. No quedó en la suite
-automática porque encadenar dos servicios (Postgres + Meilisearch) en
-cada corrida de tests es infraestructura que no se justifica todavía
-para este proyecto; si más adelante se arma un `docker-compose` para CI,
-ese es el lugar natural para sumar esa prueba end-to-end (y el
-reindexado masivo junto con ella).
+`test_search_engine.py` cubre la construcción de documentos y filtros sin
+necesitar el motor corriendo. La sincronización end-to-end en sí —indexar,
+buscar por texto, filtrar por faceta (incluyendo el filtro por array
+`organizaciones_ids`, que en Meilisearch funciona como "el array contiene
+este valor"), que `facetDistribution` tenga la forma que `queries.py`
+espera, y que lo no-publicado nunca aparezca— **ya está automatizada** en
+`test_search_engine_e2e.py`, corriendo contra una instancia real de
+Meilisearch 1.x (ver "Tests end-to-end / CI" más abajo). Antes de tener
+`docker-compose.yml` esto se validaba a mano en cada sesión de trabajo;
+ahora corre solo en cada push.
 
 ### Filtros de texto libre no cubiertos todavía
 
@@ -386,19 +436,61 @@ se repita el error si se toca ese bloque más adelante.
 ### Qué se validó
 
 `test_rate_limit.py` cubre la lectura de la variable de entorno y el
-comportamiento con Redis deshabilitado (sin necesitar una instancia
-corriendo). El resto — INCR/TTL contra Redis real, que se bloquee
-exactamente al superar el límite y no antes, el modo fail-open cuando
-Redis no responde, y sobre todo que los headers `X-RateLimit-*` /
-`Retry-After` lleguen de verdad al cliente HTTP en el `200` **y** en el
-`429`— se probó a mano de punta a punta: Postgres + Redis reales, una
-API key de prueba con límite bajo, y un cliente HTTP real haciendo varios
-requests seguidos hasta gatillar el `429`. No quedó en la suite
-automática por la misma razón que Meilisearch: encadenar tres servicios
-(Postgres + Meilisearch + Redis) en cada corrida de tests es
-infraestructura que no se justifica todavía para este proyecto — mismo
-lugar natural (`docker-compose` para CI) si más adelante se decide sumar
-esa prueba end-to-end.
+comportamiento con Redis deshabilitado, sin necesitar una instancia
+corriendo. El resto —que se bloquee exactamente al superar el límite y
+no antes, que dos API keys tengan contadores independientes, y sobre
+todo que los headers `X-RateLimit-*`/`Retry-After` lleguen de verdad al
+cliente HTTP en el `200` **y** en el `429`— **ya está automatizado** en
+`test_rate_limit_e2e.py`, corriendo contra un Redis real vía `TestClient`
+sobre la app real (ver "Tests end-to-end / CI" más abajo). El modo
+fail-open cuando Redis no responde en absoluto no está cubierto por un
+test automático (habría que tumbar Redis a mitad de un test, que es más
+lío que valor por ahora) — se validó a mano apuntando `REDIS_URL` a un
+puerto sin nada escuchando.
+
+## Límite de profundidad de query por API key
+
+`schema_publico` tenía un `QueryDepthLimiter(max_depth=10)` fijo — aplicaba
+igual para todas las API keys, aunque la tabla `api_key` ya guardaba un
+`limite_profundidad_query` distinto por fila que nadie leía (quedó
+anotado como pendiente al implementar rate limiting). `extensions.py`
+resuelve esto sin tocar la lógica de conteo de profundidad de Strawberry.
+
+### Cómo funciona
+
+- `QueryDepthLimiter(max_depth=N)` cierra `N` en el momento de construir
+  el validador — antes de que exista ningún request, así que no hay forma
+  de que dependa de qué API key está pegando con un valor fijo.
+- Se resolvió con una extensión propia (`LimiteProfundidadPorApiKey`) que,
+  en vez de recibir `max_depth` fijo, lo lee en el hook `on_operation()` —
+  que Strawberry corre una vez por request, ya con
+  `execution_context.context` (el mismo dict que arma `contexto_publico`)
+  disponible. Ahí arma el validador para *ese* request puntual, reusando
+  `strawberry.extensions.query_depth_limiter.create_validator` (la misma
+  lógica de conteo que usaba `QueryDepthLimiter`) en vez de reescribirla.
+- La selección del límite (`_resolver_limite`) vive separada del hook
+  para poder testearla sin levantar Strawberry entero: usa
+  `api_key.limite_profundidad_query` si hay una API key en el contexto y
+  es un número positivo; si no (sin api_key, o un valor en cero/negativo
+  por misconfiguración), cae a `LIMITE_POR_DEFECTO = 10` — el mismo valor
+  que tenía el límite fijo anterior, así nadie queda sin protección por
+  un dato faltante o mal cargado.
+- `MaxAliasesLimiter`/`MaxTokensLimiter` en `schema.py` se quedan con su
+  valor fijo global — la tabla `api_key` no tiene columnas de alias/tokens
+  por key, solo de profundidad, así que no hay nada por-key que leer ahí.
+
+### Qué se validó
+
+`test_extensions.py` cubre `_resolver_limite` (default, límite en
+cero/negativo, contexto ausente o con forma rara) sin necesitar el stack
+completo. Que el límite realmente se aplique —con el mensaje de error
+mostrando el número correcto— **ya está automatizado** en
+`test_extensions_e2e.py`: la misma query GraphQL anidada, con dos API
+keys de límite distinto (10 y 2), contra el schema público real montado
+en FastAPI (ver "Tests end-to-end / CI" más abajo). La de límite 10 la
+deja pasar (`200`, sin errores); la de límite 2 la rechaza con
+`"exceeds maximum operation depth of 2"` — confirmando que el número que
+aparece en el error es el de esa key puntual, no un valor fijo global.
 
 ## Pendiente antes de producción
 
@@ -406,16 +498,17 @@ esa prueba end-to-end.
   correctud funcional contra Postgres real; falta un test que abra
   muchas conexiones simultáneas contra un pool chico para calibrar
   `min_size`/`max_size` en `db.py` según el tráfico esperado.
-- **Docker-compose para CI**: correr Postgres + Meilisearch + Redis
-  juntos en la suite de tests (ver notas en las secciones de Meilisearch
-  y Rate limiting).
 - **Índice de conteo de facetas (fallback Postgres)**: `contar_facetas_*`
   hace varios `GROUP BY` por request; solo aplica cuando Meilisearch no
   está configurado, pero si ese fallback se usa en producción con
   volumen alto, conviene cachear estos conteos unos segundos.
-- **`limite_profundidad_query` sin usar**: la tabla `api_key` y
-  `ApiKeyActual` ya traen este campo por fila, pero `schema_publico`
-  (`schema.py`) aplica un `QueryDepthLimiter` con un `max_depth=10` fijo
-  para todas las keys por igual — el límite por-key nunca se lee todavía.
-  No se tocó en esta tanda (es un cambio en `schema.py`/`app.py`, no en
-  rate limiting), pero quedó anotado acá para no perderlo de vista.
+- **`docker-compose.yml` en sí no se corrió contra un Docker real todavía**:
+  se armó y se validó su YAML (sintaxis, estructura, los tres servicios
+  con healthcheck), y los tests `*_e2e.py` que va a alimentar se
+  corrieron y pasan de verdad — pero contra Postgres/Meilisearch/Redis
+  levantados directamente (no contenerizados), no a través del compose
+  en sí, porque el entorno donde se armó esto no tenía Docker disponible.
+  Antes de confiar en el workflow de CI, conviene correr
+  `docker compose up -d --wait` una vez a mano y confirmar que los tres
+  healthchecks pasan y que `pytest tests/ -v` corre igual de verde apuntando
+  a esos puertos.
