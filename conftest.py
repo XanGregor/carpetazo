@@ -20,6 +20,8 @@ os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost/
 os.environ.setdefault("JWT_SECRET", "test-secret-no-usar-en-produccion")
 
 import asyncio
+import hashlib
+import secrets
 from contextlib import asynccontextmanager
 
 import asyncpg
@@ -33,8 +35,8 @@ from graphql_api.enums import RolUsuario
 class _PoolDeUnaConexion:
     """
     La app real usa un asyncpg.Pool para que cada resolver/DataLoader saque
-    su propia conexión (necesario porque GraphQL resuelve campos hermanos en
-    paralelo). En los tests, en cambio, queremos que TODO pase por la misma
+    su propia conexión (necesario porque GraphQL puede resolver varios campos
+    en paralelo). En los tests, en cambio, queremos que TODO pase por la misma
     conexión — la de la fixture `con`, ya dentro de una transacción que se
     revierte al final — para que el rollback-based cleanup funcione y para
     que los datos insertados en el test sean visibles dentro de la misma
@@ -129,3 +131,47 @@ def contexto(con, usuario: UsuarioActual | None = None, api_key=None) -> dict:
     if api_key is not None:
         ctx["api_key"] = api_key
     return ctx
+
+
+@pytest_asyncio.fixture
+async def api_key_temporal():
+    """
+    Factory fixture para crear filas REALES de `api_key` (COMMIT real, con
+    su propia conexión — no la de la fixture `con`, que se revierte al
+    final del test).
+
+    Por qué hace falta esto y `con`/`contexto()` no alcanzan: los tests
+    end-to-end que pegan por HTTP real contra la app (`TestClient(app)`,
+    ver test_rate_limit_e2e.py y test_extensions_e2e.py) usan el pool de
+    conexiones REAL de la aplicación (`db.get_pool()`), no la conexión de
+    la fixture `con` — así que una fila insertada dentro de la transacción
+    de `con` es invisible para esos tests hasta que se revierte (nunca se
+    commitea). Se necesita una API key que exista de verdad en la base
+    para que `auth.validar_api_key` la encuentre desde esa otra conexión.
+
+    Se borra a mano al terminar el test (no hay transacción que revertir).
+    Devuelve una función factory en vez de una sola key para poder crear
+    más de una por test con distintos límites (ver el caso de "misma query,
+    dos api keys con límite de profundidad distinto").
+    """
+    conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+    creadas: list[int] = []
+
+    async def _crear(*, rate_limit_por_minuto: int = 1000, limite_profundidad_query: int = 10) -> str:
+        key_plana = f"acp_test_{secrets.token_urlsafe(16)}"
+        key_hash = hashlib.sha256(key_plana.encode("utf-8")).hexdigest()
+        fila = await conn.fetchrow(
+            "INSERT INTO api_key (nombre, email, uso_previsto, key_hash, rate_limit_por_minuto, limite_profundidad_query) "
+            "VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            "API key de test (e2e)", "e2e@test.local", "tests automatizados", key_hash,
+            rate_limit_por_minuto, limite_profundidad_query,
+        )
+        creadas.append(fila["id"])
+        return key_plana
+
+    try:
+        yield _crear
+    finally:
+        if creadas:
+            await conn.execute("DELETE FROM api_key WHERE id = ANY($1::bigint[])", creadas)
+        await conn.close()

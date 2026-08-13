@@ -77,7 +77,7 @@ async def cerrar_cliente() -> None:
     """Llamar en el shutdown de la app (ver app.py) para cerrar la conexión prolijamente."""
     global _cliente
     if _cliente is not None:
-        await _cliente.close()
+        await _cliente.aclose()
         _cliente = None
 
 

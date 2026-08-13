@@ -1,0 +1,72 @@
+# Infraestructura de test para la API GraphQL — pensado para CI, también
+# sirve para levantar los tres servicios en desarrollo local sin instalar
+# nada a mano.
+#
+# La suite de tests (pytest) NO corre dentro de este compose: corre en el
+# host (o en el runner de CI) y se conecta a estos servicios por los
+# puertos publicados (localhost:5432/7700/6379) — el mismo patrón que ya
+# usa tests/conftest.py para Postgres. No hay un servicio "api" acá
+# porque los tests pegan directo contra Postgres/Meilisearch/Redis, no a
+# través de la API HTTP (salvo los tests end-to-end de rate limiting y
+# límite de profundidad, que sí levantan la app pero vía TestClient desde
+# el propio proceso de pytest, no como un servicio aparte).
+#
+# Sin volúmenes nombrados a propósito: es infraestructura de test, no de
+# producción — cada `docker compose up` arranca de cero con el schema
+# recién cargado, lo cual además ayuda a notar temprano si
+# archivo_corrupcion_schema.sql tiene algún problema.
+#
+# Uso local:
+#   docker compose up -d --wait
+#   DATABASE_URL="postgresql://postgres:postgres@localhost:5432/archivo_corrupcion_test" \
+#   JWT_SECRET="cualquier-valor-para-tests" \
+#   MEILISEARCH_URL="http://localhost:7700" \
+#   MEILISEARCH_API_KEY="clave-de-desarrollo" \
+#   REDIS_URL="redis://localhost:6379" \
+#   python -m pytest tests/ -v
+#   docker compose down -v
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: archivo_corrupcion_test
+    ports:
+      - "5432:5432"
+    volumes:
+      # Postgres corre todo *.sql en /docker-entrypoint-initdb.d/ una sola
+      # vez, la primera vez que el data directory está vacío — exactamente
+      # lo que hace falta para tener el schema + datos semilla listos
+      # antes de que arranque cualquier test.
+      - ./archivo_corrupcion_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.40.0
+    environment:
+      MEILI_MASTER_KEY: clave-de-desarrollo
+      MEILI_NO_ANALYTICS: "true"
+      MEILI_ENV: development
+    ports:
+      - "7700:7700"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:7700/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15

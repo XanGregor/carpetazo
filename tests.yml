@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Levantar Postgres + Meilisearch + Redis
+        run: docker compose up -d --wait
+
+      - name: Correr la suite completa (incluye los tests end-to-end contra los tres servicios)
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/archivo_corrupcion_test
+          JWT_SECRET: test-secret-no-usar-en-produccion
+          MEILISEARCH_URL: http://localhost:7700
+          MEILISEARCH_API_KEY: clave-de-desarrollo
+          REDIS_URL: redis://localhost:6379
+        run: python -m pytest tests/ -v
+
+      - name: Logs de los servicios (solo si algo falló)
+        if: failure()
+        run: docker compose logs
+
+      - name: Bajar los servicios
+        if: always()
+        run: docker compose down -v
