@@ -15,7 +15,7 @@ from strawberry.fastapi import GraphQLRouter
 
 import logging
 
-from . import db, search_engine, rate_limit
+from . import db, facet_cache, search_engine, rate_limit
 from .context import contexto_interno, contexto_publico
 from .schema import schema_interno, schema_publico
 
@@ -33,6 +33,7 @@ async def lifespan(app: FastAPI):
         logger.exception("No se pudo configurar los índices de Meilisearch al arrancar.")
     yield
     await rate_limit.cerrar_cliente()
+    await facet_cache.cerrar_cliente()
     await db.close_pool()
 
 

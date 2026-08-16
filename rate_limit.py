@@ -76,9 +76,17 @@ def _obtener_cliente() -> "redis.Redis":
 async def cerrar_cliente() -> None:
     """Llamar en el shutdown de la app (ver app.py) para cerrar la conexión prolijamente."""
     global _cliente
-    if _cliente is not None:
-        await _cliente.aclose()
-        _cliente = None
+    cliente, _cliente = _cliente, None
+    if cliente is None:
+        return
+    try:
+        await cliente.aclose()
+    except RuntimeError:
+        # Mismo caso que facet_cache.cerrar_cliente(): el event loop al que
+        # quedó atado este cliente ya está cerrado (típico entre tests
+        # distintos, cada uno con su propio event loop de pytest-asyncio) —
+        # no hay nada más que cerrar limpiamente, así que se ignora.
+        pass
 
 
 async def verificar_y_consumir(api_key_id: int, limite_por_minuto: int) -> tuple[bool, int, int]:

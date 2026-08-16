@@ -1,39 +1,11 @@
-"""
-Query root. Se usa tal cual en ambos schemas (interno y público) — leer
-información ya publicada no requiere rol ni API key; lo que distingue a
-la superficie pública es que su schema no expone Mutation en absoluto
-(ver schema.py) y que su router exige X-API-Key antes de llegar acá
-(ver context.py).
-
-Cada resolver saca su propia conexión de info.context["pool"] con
-`async with pool.acquire() as con:` — no se reutiliza una conexión
-compartida entre resolvers, porque GraphQL puede resolver varios campos
-en paralelo (ver la nota en dataloaders.py).
-
-buscar_hechos_judiciales / buscar_declaraciones tienen DOS implementaciones:
-  - _meilisearch: cuando search_engine.habilitado() — usa el motor para
-    texto + filtros + facetDistribution (los conteos en vivo tipo
-    Letterboxd salen nativos del motor, no hay que calcularlos a mano).
-    Los IDs que devuelve se hidratan contra Postgres vía DataLoader, así
-    que el motor decide QUÉ matchea pero Postgres sigue siendo la fuente
-    de verdad de los datos que se muestran.
-  - _postgres: fallback con ILIKE + GROUP BY, para desarrollo local sin
-    tener Meilisearch corriendo, o si el motor está caído.
-
-Nota sobre paginación: el cursor de Postgres es keyset (id < cursor) y el
-de Meilisearch es offset numérico — son esquemas distintos por debajo del
-mismo campo `cursor: String`. No es un problema en la práctica porque
-`habilitado()` es una config fija por deploy (no cambia entre un request y
-el siguiente de la misma sesión de búsqueda), pero un cliente no debería
-asumir que el formato del cursor es estable entre ambientes.
-"""
 from __future__ import annotations
 
+import json
 from typing import Optional
 
 import strawberry
 
-from . import db, search_engine
+from . import db, facet_cache, search_engine
 from .inputs import (
     FacetasDeclaracion,
     FacetasHechoJudicial,
@@ -55,13 +27,6 @@ def _cursor_a_id(cursor: Optional[str]) -> Optional[int]:
 def _cursor_a_offset(cursor: Optional[str]) -> int:
     return int(cursor) if cursor else 0
 
-
-# ---------------------------------------------------------------------------
-# Construcción de filtros de Meilisearch (sintaxis: "campo = valor", con
-# paréntesis + OR para "cualquiera de estos" y AND entre categorías distintas
-# — la misma lógica OR-interno/AND-entre-facetas que se definió para el
-# buscador). Los valores de texto van entre comillas dobles.
-# ---------------------------------------------------------------------------
 
 def _filtro_meilisearch_hj(filtro: FiltroHechoJudicial) -> str:
     partes = ['estado_publicacion = "publicado"']
@@ -100,6 +65,38 @@ def _filtro_meilisearch_decl(filtro: FiltroDeclaracion) -> str:
     if filtro.fecha_hasta:
         partes.append(f"fecha <= {search_engine.fecha_a_timestamp(filtro.fecha_hasta)}")
     return " AND ".join(partes)
+
+
+# ---------------------------------------------------------------------------
+# Clave de cache para los conteos de facetas del fallback de Postgres (ver
+# facet_cache.py) — determinística: la misma combinación de filtros activos
+# siempre arma la misma clave, ordenando listas para que el orden en que
+# llegaron los ids no invente cache misses de más.
+# ---------------------------------------------------------------------------
+
+def _clave_cache_facetas_hj(filtro: FiltroHechoJudicial) -> str:
+    partes = {
+        "categorias": sorted(str(i) for i in (filtro.categorias_delito_ids or [])),
+        "estados": sorted(e.value for e in (filtro.estados_judiciales or [])),
+        "organizaciones": sorted(str(i) for i in (filtro.organizaciones_ids or [])),
+        "provincias": sorted(str(i) for i in (filtro.provincias_ids or [])),
+        "fecha_desde": filtro.fecha_desde.isoformat() if filtro.fecha_desde else None,
+        "fecha_hasta": filtro.fecha_hasta.isoformat() if filtro.fecha_hasta else None,
+        "texto": filtro.texto,
+    }
+    return "hj:" + json.dumps(partes, sort_keys=True)
+
+
+def _clave_cache_facetas_decl(filtro: FiltroDeclaracion) -> str:
+    partes = {
+        "tipos": sorted(t.value for t in (filtro.tipos or [])),
+        "organizaciones": sorted(str(i) for i in (filtro.organizaciones_ids or [])),
+        "provincias": sorted(str(i) for i in (filtro.provincias_ids or [])),
+        "fecha_desde": filtro.fecha_desde.isoformat() if filtro.fecha_desde else None,
+        "fecha_hasta": filtro.fecha_hasta.isoformat() if filtro.fecha_hasta else None,
+        "texto": filtro.texto,
+    }
+    return "decl:" + json.dumps(partes, sort_keys=True)
 
 
 @strawberry.type
@@ -157,10 +154,6 @@ class Query:
         return await _buscar_decl_postgres(info, filtro, paginacion)
 
 
-# ---------------------------------------------------------------------------
-# Implementación Meilisearch
-# ---------------------------------------------------------------------------
-
 async def _buscar_hj_meilisearch(
     info: strawberry.Info, filtro: FiltroHechoJudicial, paginacion: Paginacion
 ) -> PaginaHechosJudiciales:
@@ -176,7 +169,7 @@ async def _buscar_hj_meilisearch(
     dataloaders = info.context["dataloaders"]
     ids = [int(hit["id"]) for hit in resultado.get("hits", [])]
     hidratados = await dataloaders.hecho_judicial_por_id.load_many(ids) if ids else []
-    items = [h for h in hidratados if h is not None]  # por si el índice quedó desactualizado
+    items = [h for h in hidratados if h is not None]
 
     total = resultado.get("estimatedTotalHits", len(items))
     hay_mas = offset + len(ids) < total
@@ -239,10 +232,6 @@ async def _buscar_decl_meilisearch(
     )
 
 
-# ---------------------------------------------------------------------------
-# Implementación Postgres (fallback de desarrollo / motor caído)
-# ---------------------------------------------------------------------------
-
 async def _buscar_hj_postgres(
     info: strawberry.Info, filtro: FiltroHechoJudicial, paginacion: Paginacion
 ) -> PaginaHechosJudiciales:
@@ -267,15 +256,20 @@ async def _buscar_hj_postgres(
         hay_mas = len(filas) > paginacion.limite
         filas = filas[: paginacion.limite]
 
-        conteos = await db.contar_facetas_hecho_judicial(
-            con,
-            organizaciones_ids=org_ids,
-            provincias_ids=prov_ids,
-            fecha_desde=filtro.fecha_desde,
-            fecha_hasta=filtro.fecha_hasta,
-            texto=filtro.texto,
-        )
-    total = sum(c["cantidad"] for c in conteos["categorias_delito"])
+        async def _calcular_conteos() -> dict:
+            return await db.contar_facetas_hecho_judicial(
+                con,
+                categorias_delito_ids=cat_ids,
+                estados_judiciales=estados,
+                organizaciones_ids=org_ids,
+                provincias_ids=prov_ids,
+                fecha_desde=filtro.fecha_desde,
+                fecha_hasta=filtro.fecha_hasta,
+                texto=filtro.texto,
+            )
+
+        conteos = await facet_cache.obtener_o_calcular(_clave_cache_facetas_hj(filtro), _calcular_conteos)
+    total = conteos["total"]
 
     return PaginaHechosJudiciales(
         items=[to_hecho_judicial(f) for f in filas],
@@ -321,15 +315,19 @@ async def _buscar_decl_postgres(
         hay_mas = len(filas) > paginacion.limite
         filas = filas[: paginacion.limite]
 
-        conteos = await db.contar_facetas_declaracion(
-            con,
-            organizaciones_ids=org_ids,
-            provincias_ids=prov_ids,
-            fecha_desde=filtro.fecha_desde,
-            fecha_hasta=filtro.fecha_hasta,
-            texto=filtro.texto,
-        )
-    total = sum(c["cantidad"] for c in conteos["tipos"])
+        async def _calcular_conteos() -> dict:
+            return await db.contar_facetas_declaracion(
+                con,
+                tipos=tipos,
+                organizaciones_ids=org_ids,
+                provincias_ids=prov_ids,
+                fecha_desde=filtro.fecha_desde,
+                fecha_hasta=filtro.fecha_hasta,
+                texto=filtro.texto,
+            )
+
+        conteos = await facet_cache.obtener_o_calcular(_clave_cache_facetas_decl(filtro), _calcular_conteos)
+    total = conteos["total"]
 
     return PaginaDeclaraciones(
         items=[to_declaracion(f) for f in filas],
