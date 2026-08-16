@@ -41,11 +41,11 @@ Todo el paquete fue validado con **tests de integración reales contra
 PostgreSQL** (no solo import checks): 46 tests que corren el schema SQL
 completo, ejecutan mutations y queries de GraphQL de punta a punta,
 verifican los permisos por rol, y prueban la construcción de documentos/
-filtros de Meilisearch — más otros 12 tests end-to-end contra Meilisearch,
-Redis y el schema público real, corriendo con `docker-compose.yml` (ver
-"Tests end-to-end / CI" más abajo). Ese proceso encontró y corrigió varios
-bugs reales antes de que llegaran a producción — ver "Qué encontraron los
-tests" más abajo.
+filtros de Meilisearch — más otros 23 tests end-to-end/de concurrencia
+contra Meilisearch, Redis, el schema público real y el pool de conexiones,
+corriendo con `docker-compose.yml` (ver "Tests end-to-end / CI" más
+abajo). Ese proceso encontró y corrigió varios bugs reales antes de que
+llegaran a producción — ver "Qué encontraron los tests" más abajo.
 
 ## Tests
 
@@ -75,6 +75,11 @@ Los tests están en `tests/`, organizados por capa:
 | `test_search_engine_e2e.py` | **End-to-end contra Meilisearch real**: indexar, buscar por texto, filtrar por faceta (incluido el array `organizaciones_ids`), forma de `facetDistribution`, que lo no-publicado nunca aparezca, y borrado — se salta si no hay `MEILISEARCH_URL` |
 | `test_rate_limit_e2e.py` | **End-to-end contra Redis real** vía `TestClient` sobre la app real: bloqueo exacto al superar el límite, contadores independientes por API key, y que los headers `X-RateLimit-*`/`Retry-After` lleguen en el `200` **y** en el `429` — se salta si no hay `REDIS_URL` |
 | `test_extensions_e2e.py` | **End-to-end contra el schema público real**: la misma query anidada rechazada o aceptada según el `limite_profundidad_query` de la API key usada |
+| `test_db_pool.py` | Regresión: llamadas concurrentes a `db.get_pool()` devuelven siempre el mismo pool (ver "Calibración del pool de asyncpg") |
+| `test_pool_concurrencia.py` | Smoke test rápido para CI: una ráfaga de requests concurrentes contra la query con más fan-out no rompe nada — no calibra ni mide latencia, para eso está `scripts/test_carga_pool.py` |
+| `test_facet_cache.py` | Lectura de la variable de entorno y comportamiento del cache en memoria (hit, expiración por TTL, claves distintas no se pisan) — sin necesitar Redis corriendo |
+| `test_facet_cache_e2e.py` | **End-to-end contra Redis real**: que el valor quede guardado de verdad (no solo "no explotó"), con el TTL pedido, y que una segunda llamada lo lea de ahí — se salta si no hay `REDIS_URL` |
+| `test_facetas_fallback.py` | Regresión del bug de auto-filtrado de facetas (ver "Fallback de Postgres" más abajo): cada faceta excluye su propio filtro pero respeta los demás, y `total` refleja todos los filtros activos |
 
 Cada test corre dentro de una transacción que se revierte al final
 (`tests/conftest.py`), así que no hace falta limpiar la base entre tests
@@ -143,6 +148,28 @@ docker compose down -v
    statement (corregido tanto acá como en `archivo_corrupcion_schema.sql`).
 3. Un warning de deprecación real de Strawberry (pasar instancias de
    extensión en vez de factories) — corregido en `schema.py`.
+4. **Condición de carrera en `db.get_pool()`** (encontrado al escribir
+   `scripts/test_carga_pool.py`, ver "Calibración del pool de asyncpg"
+   más abajo): sin lock, varios requests concurrentes contra un pool
+   recién frío podían crear más de un pool antes de que el primero
+   terminara de asignarse a la variable global — los "perdedores" de esa
+   carrera quedaban huérfanos, con sus conexiones abiertas para siempre.
+   Se confirmó de verdad: 20 llamadas concurrentes a `get_pool()` sin el
+   lock creaban 20 pools distintos; con el lock, 1. Corregido con
+   double-checked locking en `db.py`.
+5. **Clientes de Redis atados a un event loop que ya cerró**
+   (`rate_limit.py` y `facet_cache.py`, encontrado al sumar
+   `facet_cache.py` y correr la suite completa de punta a punta): el
+   cliente de `redis.asyncio` se ata al primer event loop que lo usa de
+   verdad — con varios archivos de test usando `TestClient(app)` en
+   secuencia (cada uno con su propio event loop de pytest-asyncio), el
+   `cerrar_cliente()` de un test posterior intentaba cerrar un cliente
+   creado en el event loop de un test anterior, ya cerrado, y tiraba
+   `RuntimeError: Event loop is closed` — no en cada corrida, solo en
+   ciertas combinaciones de qué test tocaba el cliente primero. Corregido
+   en ambos módulos: `cerrar_cliente()` ahora ignora ese `RuntimeError`
+   puntual (las conexiones ya murieron junto con ese event loop, no hay
+   nada más que cerrar limpiamente).
 
 ## Instalación
 
@@ -159,7 +186,9 @@ export JWT_SECRET="una-clave-larga-y-aleatoria"   # nunca el valor default en pr
 
 Opcionales, cada una con su propio fallback si no se setea (ver las
 secciones "Meilisearch" y "Rate limiting" más abajo): `MEILISEARCH_URL`,
-`MEILISEARCH_API_KEY`, `REDIS_URL`.
+`MEILISEARCH_API_KEY`, `REDIS_URL`. También opcionales, para calibrar el
+pool de conexiones sin redeploy (ver "Calibración del pool de asyncpg"):
+`DB_POOL_MIN_SIZE` (default 2), `DB_POOL_MAX_SIZE` (default 10).
 
 ## Correr en desarrollo
 
@@ -492,16 +521,235 @@ deja pasar (`200`, sin errores); la de límite 2 la rechaza con
 `"exceeds maximum operation depth of 2"` — confirmando que el número que
 aparece en el error es el de esa key puntual, no un valor fijo global.
 
+## Calibración del pool de asyncpg
+
+`scripts/test_carga_pool.py` es la herramienta para calibrar
+`DB_POOL_MIN_SIZE`/`DB_POOL_MAX_SIZE` (ver `db.py`) contra tráfico
+simulado, en vez de adivinar un número. Es un script aparte de la suite
+de tests (`tests/test_pool_concurrencia.py` es el smoke test rápido que sí
+corre en cada push, ver más arriba) porque calibrar es un ejercicio manual
+y ocasional, no algo que tenga sentido gatear en CI: es lento comparado
+con el resto de la suite, y sus resultados dependen del hardware de la
+corrida — un número "malo" en un runner de CI compartido no significa
+nada, hay que correrlo contra algo parecido a producción para que el
+resultado sirva.
+
+### Por qué esto es sobre todo un problema de latencia, no de errores
+
+`pool.acquire()` de asyncpg **nunca falla un request por pool agotado** —
+si las `max_size` conexiones están ocupadas, el request que sigue
+simplemente espera en cola hasta que una se libera (o hasta un timeout
+explícito, que acá no se configuró). Esto se confirmó en el barrido de
+abajo: **cero errores en las nueve combinaciones probadas**, incluso con
+concurrencia muy por encima del tamaño del pool (ej. 50 requests
+simultáneos contra un pool de 5). Calibrar acá no es evitar que el
+sistema se rompa — ya es correcto con cualquier tamaño ≥1 — es mantener
+la latencia razonable bajo la concurrencia esperada sin abrir más
+conexiones de las que Postgres necesita sostener.
+
+### El riesgo específico de este esquema: fan-out por request, no solo por tráfico
+
+El riesgo real acá no es "muchos usuarios pegándole a la API a la vez" —
+es que **GraphQL resuelve campos hermanos en paralelo y cada
+resolver/DataLoader saca su propia conexión del pool** (ver la nota
+repetida en `dataloaders.py`/`queries.py`/`mutations.py`). Una sola query
+bien anidada — una ficha con `fuentes`, `personas`, `organizaciones`,
+`categoriaDelito`, `provincia` y `relaciones` — pide **6 conexiones
+simultáneas por sí sola**, sin que haga falta ningún otro cliente
+pegándole a la API al mismo tiempo. Por eso el script mide dos queries de
+ejemplo por separado: `simple` (1 conexión) y `ancha` (6 conexiones,
+el peor caso realista de una ficha completa).
+
+### Uso
+
+```bash
+# Un tamaño de pool puntual:
+python -m scripts.test_carga_pool --pool-max 10 --concurrencia 20 --query ancha
+
+# Barrido de varias combinaciones representativas en una sola corrida
+# (recrea el pool entre cada una, mismo proceso):
+python -m scripts.test_carga_pool --barrido
+```
+
+### Qué se encontró corriéndolo de verdad
+
+**Un bug real de concurrencia** (ver también "Qué encontraron los
+tests"): escribir este script encontró una condición de carrera genuina
+en `db.get_pool()` — sin lock, una ráfaga de requests contra un pool
+recién frío podía crear más de un pool antes de que el primero terminara
+de asignarse a la variable global, dejando pools "perdedores" huérfanos
+con sus conexiones abiertas para siempre. Un burst de 20 requests
+concurrentes terminaba en `TooManyConnectionsError: sorry, too many
+clients already` — nada sutil. Ya está corregido (double-checked locking
++ lock de inicialización perezosa, con su propio test de regresión en
+`tests/test_db_pool.py`).
+
+**Arranque en frío, no solo contención en régimen estable**: asyncpg abre
+`min_size` conexiones al crear el pool, pero las conexiones por encima de
+eso se abren recién bajo demanda (TCP + fork del backend en Postgres). La
+primera ráfaga que supera `min_size` paga ese costo de una sola vez — se
+midió un burst de 20 contra un pool recién creado en **~400ms**, contra
+**~4ms** para la misma ráfaga con el pool ya con las conexiones abiertas
+(dos órdenes de magnitud, no ruido de medición). Esto es lo más accionable
+del barrido: **`min_size` importa para la latencia justo después de un
+deploy/restart/autoscaling**, no solo `max_size` para el régimen estable —
+si se espera tráfico real apenas arranca un pod nuevo, conviene que
+`min_size` esté más cerca de la concurrencia base esperada, no en 2.
+
+**Barrido completo** (Postgres + la app corriendo en la misma máquina de
+desarrollo, base casi vacía — los números absolutos NO son
+representativos de producción, pero el patrón relativo sí es real):
+
+| pool max | concurrencia | raw p50/p99 (ms) | simple p50/p99 (ms) | ancha p50/p99 (ms) |
+|---|---|---|---|---|
+| 5  | 5  | 0.7 / 1.1  | 7.9 / 42.0   | 21.3 / 75.3   |
+| 5  | 20 | 2.3 / 3.7  | 24.0 / 67.4  | 72.9 / 131.2  |
+| 5  | 50 | 4.7 / 8.1  | 70.8 / 122.5 | 210.0 / 329.0 |
+| 10 | 5  | 0.6 / 1.0  | 7.0 / 51.5   | 22.4 / 234.7  |
+| 10 | 20 | 2.3 / 2.6  | 25.0 / 73.2  | 69.1 / 203.2  |
+| 10 | 50 | 4.6 / 7.8  | 64.0 / 114.5 | 209.7 / 370.8 |
+| 20 | 5  | 0.7 / 1.1  | 7.3 / 52.1   | 25.9 / 706.5  |
+| 20 | 20 | 2.7 / 3.5  | 27.7 / 52.0  | 83.4 / 275.8  |
+| 20 | 50 | 7.1 / 9.6  | 86.1 / 158.4 | 239.5 / 418.2 |
+
+Dos lecturas de esta tabla:
+
+- **`ancha` tiene sistemáticamente más cola (p99) que `simple`** con la
+  misma concurrencia — confirma que el fan-out por request es el
+  principal sospechoso de latencia larga en este esquema, más que el
+  volumen de requests en sí.
+- **Subir `max_size` de 10 a 20 no mejoró `ancha` en régimen estable** a
+  estos niveles de carga (p50 termina parecido o incluso levemente peor
+  en algunos casos) — en este sandbox, el costo dominante de `ancha` es
+  la cantidad de round-trips por request (6), no la escasez de lugares en
+  el pool. Agrandar `max_size` a lo bruto no es gratis (son más conexiones
+  que Postgres tiene que sostener) y acá no compró latencia mejor; antes
+  de subirlo en producción conviene confirmar con este mismo script
+  contra tráfico real que el cuello de botella es efectivamente el pool y
+  no el fan-out en sí.
+
+### Qué no se validó
+
+Todo esto se corrió contra una base casi vacía en una sola máquina de
+desarrollo (sin Docker disponible en el entorno donde se armó esto, igual
+que se anotó para `docker-compose.yml`) — sirve para encontrar bugs de
+concurrencia (y encontró uno real) y para entender el *patrón* relativo
+entre configuraciones, pero los milisegundos absolutos no van a
+coincidir con producción (hardware distinto, red real entre la app y
+Postgres, volumen de datos real, y tráfico de otros clientes compartiendo
+el mismo Postgres). Antes de fijar un tamaño de pool para producción,
+conviene correr `scripts/test_carga_pool.py --barrido` contra una réplica
+de producción (o al menos contra `docker-compose.yml` en un entorno
+comparable), no confiar en los números de esta sección.
+
+## Fallback de Postgres: bug de facetas encontrado al cachear
+
+`buscar_hechos_judiciales`/`buscar_declaraciones` caen a Postgres (`ILIKE`
++ `GROUP BY`) cuando Meilisearch no está configurado (ver
+`search_engine.habilitado()`). Al implementar el cache de corta duración
+para esos `GROUP BY` (pedido pendiente desde la sección de Meilisearch),
+revisar `db.contar_facetas_hecho_judicial`/`contar_facetas_declaracion`
+de cerca encontró un bug real de tres partes en cómo se calculaban los
+conteos — cachear resultados ya incorrectos solo los haría más
+persistentes, así que se corrigió de una en vez de cachearlos tal cual
+estaban.
+
+### Qué estaba mal
+
+El propio docstring de la función decía "aplicando los DEMÁS filtros
+activos (no el de la propia faceta que se está contando) — así el
+usuario ve conteos ya filtrados por lo que seleccionó en las otras
+columnas, igual que en Letterboxd". En la práctica:
+
+1. **`categorias_delito_ids`/`estados_judiciales` ni se aceptaban como
+   parámetro** en `contar_facetas_hecho_judicial` (mismo problema con
+   `tipos` en `contar_facetas_declaracion`) — elegir una categoría de
+   delito no tenía ningún efecto en ningún conteo de faceta mostrado.
+2. **Las tres queries de conteo compartían un único `WHERE`**, que sí
+   incluía el filtro de provincia — incluso al calcular la propia faceta
+   de provincias. Si el usuario ya filtraba por Mendoza, el selector de
+   provincias quedaba mostrando SOLO Mendoza en vez de todas las
+   provincias con sus conteos como alternativa (el punto entero de un
+   selector tipo Letterboxd es poder ver y cambiar a otra opción).
+3. **`total_aproximado` salía de sumar la faceta de categorías** —que a
+   propósito excluye el filtro de categoría—, así que en cuanto había un
+   filtro de categoría activo, el total quedaba inflado (contaba
+   resultados de categorías no seleccionadas). Confirmado con un test
+   concreto: con un filtro de categoría activo que debía dar 1 resultado,
+   sumar la faceta daba 2.
+
+### Cómo quedó
+
+Cada faceta arma su propio `WHERE` (`_construir_where(excluir=...)` en
+`db.py`), excluyendo solo su propio filtro y aplicando todos los demás —
+incluidos los que antes ni se aceptaban como parámetro. El total sale de
+un `COUNT(*)` aparte con TODOS los filtros aplicados (`excluir="ninguno"`),
+no de sumar ninguna faceta. Las funciones ahora devuelven dicts planos en
+vez de `asyncpg.Record` (necesario para que el resultado sea
+JSON-serializable y cacheable, ver más abajo).
+
+## Cache de facetas (`facet_cache.py`)
+
+Con el fallback de Postgres corregido, ahora sí tiene sentido cachearlo:
+cada búsqueda sin Meilisearch dispara, además de la query principal, tres
+o dos `GROUP BY` más — bajo volumen alto eso es carga extra evitable,
+porque los conteos de faceta no cambian salvo que se publique/edite
+contenido, y ni siquiera hace falta que se reflejen al instante (la
+propia UI tipo Letterboxd que motivó este diseño ya tolera "conteos que
+se actualizan cada tanto").
+
+### Cómo funciona
+
+- TTL corto (5 segundos por defecto) — `queries.py` envuelve la llamada a
+  `contar_facetas_*` con `facet_cache.obtener_o_calcular(clave, calcular)`,
+  con una clave armada a partir de la combinación exacta de filtros
+  activos (`_clave_cache_facetas_hj`/`_clave_cache_facetas_decl`).
+- Backend: Redis si está configurado (`REDIS_URL`, la misma variable que
+  ya usa `rate_limit.py`) — así el cache se comparte entre todos los
+  workers/réplicas de la app. Sin Redis, cae a un cache en memoria del
+  proceso — sirve igual para un solo worker o desarrollo local.
+- Fail-open ante fallos de Redis: un error leyendo/escribiendo el cache
+  nunca impide servir la búsqueda — se loguea y se recalcula contra
+  Postgres, mismo criterio que Meilisearch/rate limiting.
+
+### Variables de entorno
+
+Ninguna nueva — reusa `REDIS_URL` si ya está configurada para rate
+limiting. Sin ella, el cache en memoria queda activo igual (no hace falta
+Redis para que esto ayude, solo para que ayude *entre* workers).
+
+### Un bug de infraestructura de tests que esto destapó
+
+Sumar el cliente de Redis de `facet_cache.py` hizo más probable pisar un
+bug latente que también estaba en `rate_limit.py`: un cliente de
+`redis.asyncio` se ata al primer event loop que lo usa de verdad — con
+varios archivos de test usando `TestClient(app)` en secuencia (cada uno
+con su propio event loop de pytest-asyncio), `cerrar_cliente()` de un
+test posterior podía intentar cerrar un cliente creado en el event loop
+de un test anterior, ya cerrado, y tiraba `RuntimeError: Event loop is
+closed` — no en cada corrida, solo en ciertas combinaciones de orden.
+Corregido en los dos módulos: `cerrar_cliente()` ahora ignora ese
+`RuntimeError` puntual en vez de tumbar el shutdown (las conexiones ya
+murieron junto con ese event loop, no hay nada más que cerrar
+limpiamente). No afecta producción real: ahí hay un solo event loop
+persistente durante toda la vida del proceso — esto era puramente un
+problema de cómo pytest-asyncio arranca un loop nuevo por test.
+
+### Qué se validó
+
+`test_facet_cache.py` cubre la lectura de la variable de entorno y el
+comportamiento del cache en memoria (hit, expiración por TTL, que claves
+distintas no se pisen) sin necesitar Redis corriendo. `test_facet_cache_e2e.py`
+confirma contra un Redis real que el valor efectivamente queda guardado
+(no solo que la función no explota) con el TTL pedido, y que una segunda
+llamada lee de ahí en vez de recalcular. `test_facetas_fallback.py` cubre
+el bug de las tres partes de arriba contra Postgres real: que cada faceta
+excluya su propio filtro pero respete los demás, y que `total` no
+coincida con sumar una faceta que se excluye a sí misma cuando hay un
+filtro activo que las diferenciaría.
+
 ## Pendiente antes de producción
 
-- **Tests de carga/concurrencia real**: los tests actuales prueban
-  correctud funcional contra Postgres real; falta un test que abra
-  muchas conexiones simultáneas contra un pool chico para calibrar
-  `min_size`/`max_size` en `db.py` según el tráfico esperado.
-- **Índice de conteo de facetas (fallback Postgres)**: `contar_facetas_*`
-  hace varios `GROUP BY` por request; solo aplica cuando Meilisearch no
-  está configurado, pero si ese fallback se usa en producción con
-  volumen alto, conviene cachear estos conteos unos segundos.
 - **`docker-compose.yml` en sí no se corrió contra un Docker real todavía**:
   se armó y se validó su YAML (sintaxis, estructura, los tres servicios
   con healthcheck), y los tests `*_e2e.py` que va a alimentar se
@@ -512,3 +760,8 @@ aparece en el error es el de esa key puntual, no un valor fijo global.
   `docker compose up -d --wait` una vez a mano y confirmar que los tres
   healthchecks pasan y que `pytest tests/ -v` corre igual de verde apuntando
   a esos puertos.
+- **Tamaño de pool para producción todavía no elegido**: `scripts/test_carga_pool.py`
+  ya está listo y encontró un bug real (ver "Calibración del pool de
+  asyncpg"), pero el barrido se corrió contra una base casi vacía en una
+  sola máquina de desarrollo — falta correrlo contra algo representativo
+  de producción antes de fijar `DB_POOL_MIN_SIZE`/`DB_POOL_MAX_SIZE` ahí.

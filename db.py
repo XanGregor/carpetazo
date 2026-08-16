@@ -11,6 +11,7 @@ con AND — la lógica que se definió para el buscador tipo Letterboxd.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import date
 from typing import Any, Optional
@@ -18,24 +19,66 @@ from typing import Any, Optional
 import asyncpg
 
 _pool: Optional[asyncpg.Pool] = None
+_pool_lock: Optional[asyncio.Lock] = None
 
 
 async def get_pool() -> asyncpg.Pool:
-    global _pool
+    """
+    min_size/max_size configurables por variable de entorno
+    (DB_POOL_MIN_SIZE / DB_POOL_MAX_SIZE), con los mismos valores que ya
+    había hardcodeados como default — así se puede calibrar el tamaño del
+    pool en producción sin redeploy, y el script de carga
+    (scripts/test_carga_pool.py) puede recrear el pool con otro tamaño
+    dentro del mismo proceso para comparar configuraciones (cerrar con
+    close_pool() y volver a llamar get_pool() con la env var cambiada).
+
+    El chequeo `if _pool is None` está protegido con un lock (double-checked
+    locking) — SIN el lock, si varios requests concurrentes le pegan a un
+    pool recién frío (el caso típico: una ráfaga de tráfico justo después
+    de levantar la app), todos ven `_pool is None` a la vez y cada uno
+    dispara su propio `asyncpg.create_pool(...)` antes de que el primero
+    termine de asignarse a la variable global — los pools "perdedores" de
+    esa carrera quedan huérfanos: nada vuelve a referenciarlos, así que
+    nunca se cierran, y sus conexiones quedan abiertas en Postgres hasta
+    que se cae la app. Esto no era hipotético: se detectó de verdad
+    escribiendo el test de carga/concurrencia (scripts/test_carga_pool.py)
+    — un burst de 20 requests contra un pool frío terminaba en
+    `TooManyConnectionsError: sorry, too many clients already`, y
+    aislando el problema se confirmó que 20 llamadas concurrentes a
+    get_pool() sin este lock creaban 20 pools distintos en vez de 1.
+
+    El lock en sí se crea perezosamente (no a nivel de módulo) y se
+    resetea junto con el pool en close_pool(): un asyncio.Lock() creado a
+    nivel de módulo se ata al primer event loop que lo usa (en su primer
+    `async with`), lo cual revienta con "bound to a different event loop"
+    en cuanto otro código (típicamente un test distinto, cada uno con su
+    propio event loop) intenta usar ese mismo lock — también se detectó
+    de verdad al escribir el test de regresión (tests/test_db_pool.py).
+    Crear el Lock() en sí es seguro sin protección extra porque no hay
+    ningún `await` de por medio: dentro del modelo cooperativo de asyncio
+    ese chequeo corre atómico, no hay forma de que dos tasks se
+    entrelacen justo ahí.
+    """
+    global _pool, _pool_lock
     if _pool is None:
-        _pool = await asyncpg.create_pool(
-            dsn=os.environ["DATABASE_URL"],
-            min_size=2,
-            max_size=10,
-        )
+        if _pool_lock is None:
+            _pool_lock = asyncio.Lock()
+        async with _pool_lock:
+            if _pool is None:  # otro task pudo haber creado el pool mientras esperábamos el lock
+                _pool = await asyncpg.create_pool(
+                    dsn=os.environ["DATABASE_URL"],
+                    min_size=int(os.environ.get("DB_POOL_MIN_SIZE", "2")),
+                    max_size=int(os.environ.get("DB_POOL_MAX_SIZE", "10")),
+                )
     return _pool
 
 
 async def close_pool() -> None:
-    global _pool
+    global _pool, _pool_lock
     if _pool is not None:
         await _pool.close()
         _pool = None
+    _pool_lock = None
 
 
 # ---------------------------------------------------------------------------
@@ -128,68 +171,110 @@ async def search_hechos_judiciales(
 async def contar_facetas_hecho_judicial(
     con: asyncpg.Connection,
     *,
+    categorias_delito_ids: Optional[list[int]],
+    estados_judiciales: Optional[list[str]],
     organizaciones_ids: Optional[list[int]],
     provincias_ids: Optional[list[int]],
     fecha_desde: Optional[date],
     fecha_hasta: Optional[date],
     texto: Optional[str],
-) -> dict[str, list[asyncpg.Record]]:
+) -> dict[str, list[dict]]:
     """
     Conteos por categoría de delito / estado judicial / provincia, aplicando
     los DEMÁS filtros activos (no el de la propia faceta que se está
     contando) — así el usuario ve "Lavado (23)" ya filtrado por lo que
     seleccionó en las otras columnas, igual que en Letterboxd.
+
+    Cada faceta arma su PROPIO WHERE (_construir_where con excluir=...) en
+    vez de compartir uno solo entre las tres — antes las tres queries
+    reusaban el mismo WHERE, que incluía el filtro de provincia incluso
+    para calcular la propia faceta de provincias (contradecía el docstring:
+    si el usuario ya filtró por Mendoza, el desplegable de provincias
+    quedaba mostrando SOLO Mendoza en vez de todas las provincias con sus
+    conteos como alternativa). categorias_delito_ids/estados_judiciales
+    tampoco se aceptaban como parámetro, así que elegir una categoría o un
+    estado no tenía ningún efecto sobre ningún conteo de faceta.
+
+    Devuelve dicts planos (no asyncpg.Record) para que el resultado sea
+    directamente cacheable/serializable a JSON — ver queries.py, que
+    envuelve esta llamada con facet_cache.obtener_o_calcular.
     """
-    condiciones = ["hj.estado_publicacion = 'publicado'"]
-    params: list[Any] = []
 
-    def agregar(cond: str, valor: Any) -> None:
-        params.append(valor)
-        condiciones.append(cond.format(n=len(params)))
+    def _construir_where(*, excluir: str) -> tuple[str, list[Any]]:
+        condiciones = ["hj.estado_publicacion = 'publicado'"]
+        params: list[Any] = []
 
-    if provincias_ids:
-        agregar("hj.provincia_id = ANY(${n}::int[])", provincias_ids)
-    if fecha_desde:
-        agregar("hj.fecha_hecho >= ${n}", fecha_desde)
-    if fecha_hasta:
-        agregar("hj.fecha_hecho <= ${n}", fecha_hasta)
-    if texto:
-        agregar("(hj.titulo ILIKE ${n} OR hj.descripcion ILIKE ${n})", f"%{texto}%")
-    if organizaciones_ids:
-        agregar(
-            "EXISTS (SELECT 1 FROM hecho_organizacion ho WHERE ho.hecho_tipo = 'hecho_judicial' "
-            "AND ho.hecho_id = hj.id AND ho.organizacion_id = ANY(${n}::bigint[]))",
-            organizaciones_ids,
-        )
-    where = " AND ".join(condiciones)
+        def agregar(cond: str, valor: Any) -> None:
+            params.append(valor)
+            condiciones.append(cond.format(n=len(params)))
 
+        if categorias_delito_ids and excluir != "categoria":
+            agregar("hj.categoria_delito_id = ANY(${n}::int[])", categorias_delito_ids)
+        if estados_judiciales and excluir != "estado":
+            agregar("hj.estado_judicial = ANY(${n}::estado_judicial[])", estados_judiciales)
+        if provincias_ids and excluir != "provincia":
+            agregar("hj.provincia_id = ANY(${n}::int[])", provincias_ids)
+        if fecha_desde:
+            agregar("hj.fecha_hecho >= ${n}", fecha_desde)
+        if fecha_hasta:
+            agregar("hj.fecha_hecho <= ${n}", fecha_hasta)
+        if texto:
+            agregar("(hj.titulo ILIKE ${n} OR hj.descripcion ILIKE ${n})", f"%{texto}%")
+        if organizaciones_ids:
+            agregar(
+                "EXISTS (SELECT 1 FROM hecho_organizacion ho WHERE ho.hecho_tipo = 'hecho_judicial' "
+                "AND ho.hecho_id = hj.id AND ho.organizacion_id = ANY(${n}::bigint[]))",
+                organizaciones_ids,
+            )
+        return " AND ".join(condiciones), params
+
+    where_categoria, params_categoria = _construir_where(excluir="categoria")
     categorias = await con.fetch(
         f"""
         SELECT cd.id, cd.nombre, COUNT(*) AS cantidad
         FROM hecho_judicial hj JOIN categoria_delito cd ON cd.id = hj.categoria_delito_id
-        WHERE {where}
+        WHERE {where_categoria}
         GROUP BY cd.id, cd.nombre ORDER BY cantidad DESC
         """,
-        *params,
+        *params_categoria,
     )
+
+    where_estado, params_estado = _construir_where(excluir="estado")
     estados = await con.fetch(
         f"""
         SELECT hj.estado_judicial AS valor, COUNT(*) AS cantidad
-        FROM hecho_judicial hj WHERE {where}
+        FROM hecho_judicial hj WHERE {where_estado}
         GROUP BY hj.estado_judicial ORDER BY cantidad DESC
         """,
-        *params,
+        *params_estado,
     )
+
+    where_provincia, params_provincia = _construir_where(excluir="provincia")
     provincias = await con.fetch(
         f"""
         SELECT p.id, p.nombre, COUNT(*) AS cantidad
         FROM hecho_judicial hj JOIN provincia p ON p.id = hj.provincia_id
-        WHERE {where}
+        WHERE {where_provincia}
         GROUP BY p.id, p.nombre ORDER BY cantidad DESC
         """,
-        *params,
+        *params_provincia,
     )
-    return {"categorias_delito": categorias, "estados_judiciales": estados, "provincias": provincias}
+
+    # Total con TODOS los filtros aplicados (sin excluir ninguno) — no
+    # alcanza con sumar la faceta de categorías: esa, a propósito, excluye
+    # el filtro de categoría, así que sumarla da "resultados en cualquier
+    # categoría" en vez de "resultados que matchean todo lo que el usuario
+    # filtró" en cuanto hay un filtro de categoría activo (ver el
+    # docstring de arriba — este era otro síntoma del mismo problema).
+    where_total, params_total = _construir_where(excluir="ninguno")
+    total = await con.fetchval(f"SELECT COUNT(*) FROM hecho_judicial hj WHERE {where_total}", *params_total)
+
+    return {
+        "categorias_delito": [dict(r) for r in categorias],
+        "estados_judiciales": [dict(r) for r in estados],
+        "provincias": [dict(r) for r in provincias],
+        "total": total,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -247,49 +332,69 @@ async def search_declaraciones(
 async def contar_facetas_declaracion(
     con: asyncpg.Connection,
     *,
+    tipos: Optional[list[str]],
     organizaciones_ids: Optional[list[int]],
     provincias_ids: Optional[list[int]],
     fecha_desde: Optional[date],
     fecha_hasta: Optional[date],
     texto: Optional[str],
-) -> dict[str, list[asyncpg.Record]]:
-    condiciones = ["d.estado_publicacion = 'publicado'"]
-    params: list[Any] = []
+) -> dict[str, list[dict]]:
+    """Mismo arreglo que contar_facetas_hecho_judicial: WHERE separado por
+    faceta (excluyendo el filtro propio de cada una) y devuelve dicts
+    planos en vez de asyncpg.Record — ver el docstring de esa función para
+    el detalle de qué estaba mal antes."""
 
-    def agregar(cond: str, valor: Any) -> None:
-        params.append(valor)
-        condiciones.append(cond.format(n=len(params)))
+    def _construir_where(*, excluir: str) -> tuple[str, list[Any]]:
+        condiciones = ["d.estado_publicacion = 'publicado'"]
+        params: list[Any] = []
 
-    if provincias_ids:
-        agregar("d.provincia_id = ANY(${n}::int[])", provincias_ids)
-    if fecha_desde:
-        agregar("d.fecha >= ${n}", fecha_desde)
-    if fecha_hasta:
-        agregar("d.fecha <= ${n}", fecha_hasta)
-    if texto:
-        agregar("(d.titulo ILIKE ${n} OR d.descripcion ILIKE ${n})", f"%{texto}%")
-    if organizaciones_ids:
-        agregar(
-            "EXISTS (SELECT 1 FROM hecho_organizacion ho WHERE ho.hecho_tipo = 'declaracion' "
-            "AND ho.hecho_id = d.id AND ho.organizacion_id = ANY(${n}::bigint[]))",
-            organizaciones_ids,
-        )
-    where = " AND ".join(condiciones)
+        def agregar(cond: str, valor: Any) -> None:
+            params.append(valor)
+            condiciones.append(cond.format(n=len(params)))
 
-    tipos = await con.fetch(
-        f"SELECT d.tipo AS valor, COUNT(*) AS cantidad FROM declaracion d WHERE {where} GROUP BY d.tipo ORDER BY cantidad DESC",
-        *params,
+        if tipos and excluir != "tipo":
+            agregar("d.tipo = ANY(${n}::tipo_declaracion[])", tipos)
+        if provincias_ids and excluir != "provincia":
+            agregar("d.provincia_id = ANY(${n}::int[])", provincias_ids)
+        if fecha_desde:
+            agregar("d.fecha >= ${n}", fecha_desde)
+        if fecha_hasta:
+            agregar("d.fecha <= ${n}", fecha_hasta)
+        if texto:
+            agregar("(d.titulo ILIKE ${n} OR d.descripcion ILIKE ${n})", f"%{texto}%")
+        if organizaciones_ids:
+            agregar(
+                "EXISTS (SELECT 1 FROM hecho_organizacion ho WHERE ho.hecho_tipo = 'declaracion' "
+                "AND ho.hecho_id = d.id AND ho.organizacion_id = ANY(${n}::bigint[]))",
+                organizaciones_ids,
+            )
+        return " AND ".join(condiciones), params
+
+    where_tipo, params_tipo = _construir_where(excluir="tipo")
+    tipos_conteo = await con.fetch(
+        f"SELECT d.tipo AS valor, COUNT(*) AS cantidad FROM declaracion d WHERE {where_tipo} GROUP BY d.tipo ORDER BY cantidad DESC",
+        *params_tipo,
     )
+
+    where_provincia, params_provincia = _construir_where(excluir="provincia")
     provincias = await con.fetch(
         f"""
         SELECT p.id, p.nombre, COUNT(*) AS cantidad
         FROM declaracion d JOIN provincia p ON p.id = d.provincia_id
-        WHERE {where}
+        WHERE {where_provincia}
         GROUP BY p.id, p.nombre ORDER BY cantidad DESC
         """,
-        *params,
+        *params_provincia,
     )
-    return {"tipos": tipos, "provincias": provincias}
+
+    where_total, params_total = _construir_where(excluir="ninguno")
+    total = await con.fetchval(f"SELECT COUNT(*) FROM declaracion d WHERE {where_total}", *params_total)
+
+    return {
+        "tipos": [dict(r) for r in tipos_conteo],
+        "provincias": [dict(r) for r in provincias],
+        "total": total,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +451,101 @@ async def obtener_vista_busqueda_declaracion(con: asyncpg.Connection, declaracio
         """,
         declaracion_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# Recorrido masivo de publicados — usado por scripts/reindexar_meilisearch.py
+# para el reindexado inicial (primer deploy con Meilisearch, o reconstruir
+# el índice desde cero). Mismas columnas que obtener_vista_busqueda_* de
+# arriba (así search_engine._documento_* produce el mismo documento que la
+# sincronización normal), pero trayendo muchas filas por vez en vez de una,
+# paginado por cursor de id para no cargar todo el archivo en memoria de una.
+# ---------------------------------------------------------------------------
+
+async def contar_hechos_judiciales_publicados(con: asyncpg.Connection) -> int:
+    return await con.fetchval("SELECT COUNT(*) FROM hecho_judicial WHERE estado_publicacion = 'publicado'")
+
+
+async def contar_declaraciones_publicadas(con: asyncpg.Connection) -> int:
+    return await con.fetchval("SELECT COUNT(*) FROM declaracion WHERE estado_publicacion = 'publicado'")
+
+
+async def fetch_lote_vista_busqueda_hechos_judiciales(
+    con: asyncpg.Connection, *, cursor_id: Optional[int], limite: int
+) -> list[asyncpg.Record]:
+    condiciones = ["hj.estado_publicacion = 'publicado'"]
+    params: list[Any] = []
+
+    def agregar(cond: str, valor: Any) -> None:
+        params.append(valor)
+        condiciones.append(cond.format(n=len(params)))
+
+    if cursor_id is not None:
+        agregar("hj.id > ${n}", cursor_id)
+
+    params.append(limite)
+    sql = f"""
+        SELECT
+            hj.id, hj.codigo, hj.titulo, hj.descripcion, hj.categoria_delito_id,
+            hj.estado_judicial, hj.fecha_hecho, hj.provincia_id, hj.estado_publicacion,
+            COALESCE(orgs.ids, ARRAY[]::bigint[]) AS organizaciones_ids,
+            COALESCE(orgs.nombres, ARRAY[]::text[]) AS organizaciones_nombres,
+            COALESCE(pers.nombres, ARRAY[]::text[]) AS personas_nombres
+        FROM hecho_judicial hj
+        LEFT JOIN LATERAL (
+            SELECT array_agg(o.id) AS ids, array_agg(o.nombre) AS nombres
+            FROM hecho_organizacion ho JOIN organizacion o ON o.id = ho.organizacion_id
+            WHERE ho.hecho_tipo = 'hecho_judicial' AND ho.hecho_id = hj.id
+        ) orgs ON true
+        LEFT JOIN LATERAL (
+            SELECT array_agg(p.nombre_completo) AS nombres
+            FROM hecho_persona hp JOIN persona p ON p.id = hp.persona_id
+            WHERE hp.hecho_tipo = 'hecho_judicial' AND hp.hecho_id = hj.id
+        ) pers ON true
+        WHERE {' AND '.join(condiciones)}
+        ORDER BY hj.id ASC
+        LIMIT ${len(params)}
+    """
+    return await con.fetch(sql, *params)
+
+
+async def fetch_lote_vista_busqueda_declaraciones(
+    con: asyncpg.Connection, *, cursor_id: Optional[int], limite: int
+) -> list[asyncpg.Record]:
+    condiciones = ["d.estado_publicacion = 'publicado'"]
+    params: list[Any] = []
+
+    def agregar(cond: str, valor: Any) -> None:
+        params.append(valor)
+        condiciones.append(cond.format(n=len(params)))
+
+    if cursor_id is not None:
+        agregar("d.id > ${n}", cursor_id)
+
+    params.append(limite)
+    sql = f"""
+        SELECT
+            d.id, d.codigo, d.titulo, d.descripcion, d.tipo,
+            d.fecha, d.provincia_id, d.estado_publicacion,
+            COALESCE(orgs.ids, ARRAY[]::bigint[]) AS organizaciones_ids,
+            COALESCE(orgs.nombres, ARRAY[]::text[]) AS organizaciones_nombres,
+            COALESCE(pers.nombres, ARRAY[]::text[]) AS personas_nombres
+        FROM declaracion d
+        LEFT JOIN LATERAL (
+            SELECT array_agg(o.id) AS ids, array_agg(o.nombre) AS nombres
+            FROM hecho_organizacion ho JOIN organizacion o ON o.id = ho.organizacion_id
+            WHERE ho.hecho_tipo = 'declaracion' AND ho.hecho_id = d.id
+        ) orgs ON true
+        LEFT JOIN LATERAL (
+            SELECT array_agg(p.nombre_completo) AS nombres
+            FROM hecho_persona hp JOIN persona p ON p.id = hp.persona_id
+            WHERE hp.hecho_tipo = 'declaracion' AND hp.hecho_id = d.id
+        ) pers ON true
+        WHERE {' AND '.join(condiciones)}
+        ORDER BY d.id ASC
+        LIMIT ${len(params)}
+    """
+    return await con.fetch(sql, *params)
 
 
 # ---------------------------------------------------------------------------
